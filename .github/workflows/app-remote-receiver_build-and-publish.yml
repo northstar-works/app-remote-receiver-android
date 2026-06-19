@@ -1,0 +1,100 @@
+name: Build and Publish to F-Droid TV
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout app-remote-receiver
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      # Decode the universal northstar-labs.jks keystore from secret.
+      # Same keystore used across all Northstar Labs apps so the F-Droid
+      # AllowedAPKSigningKeys fingerprint stays consistent.
+      - name: Decode keystore
+        run: echo "${{ secrets.FDROID_KEYSTORE_B64 }}" | base64 -d > release.jks
+
+      # NOTE: app/build.gradle's signingConfigs.release block must read these
+      # same env var names (KEYSTORE_FILE / KEYSTORE_PASSWORD / KEY_ALIAS / KEY_PASSWORD).
+      # Adjust if this project's signing config uses different names.
+      - name: Build release APK
+        run: ./gradlew assembleRelease
+        env:
+          KEYSTORE_FILE: ${{ github.workspace }}/release.jks
+          KEYSTORE_PASSWORD: ${{ secrets.FDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.FDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.FDROID_KEY_PASSWORD }}
+
+      - name: Locate APK and extract version info
+        id: apkinfo
+        run: |
+          set -euo pipefail
+          PKG="pro.northstarlabs.appremotereceiver"
+          APK=$(find app/build/outputs/apk/release -name "*.apk" | head -n1)
+          if [ -z "$APK" ]; then
+            echo "ERROR: no release APK found" >&2
+            exit 1
+          fi
+          VCODE=$(grep -oP 'versionCode\s+\K[0-9]+' app/build.gradle | head -n1)
+          if [ -z "$VCODE" ]; then
+            echo "ERROR: could not extract versionCode from app/build.gradle" >&2
+            exit 1
+          fi
+          OUT_NAME="${PKG}_${VCODE}.apk"
+          cp "$APK" "$OUT_NAME"
+          echo "package_id=$PKG"     >> "$GITHUB_OUTPUT"
+          echo "version_code=$VCODE" >> "$GITHUB_OUTPUT"
+          echo "out_name=$OUT_NAME"  >> "$GITHUB_OUTPUT"
+
+      - name: Checkout fdroid-tv repo
+        uses: actions/checkout@v4
+        with:
+          repository: northstar-works/fdroid-tv
+          path: fdroid-tv
+          token: ${{ secrets.FDROID_REPO_PAT }}
+
+      - name: Copy signed APK into fdroid-tv repo
+        run: |
+          mkdir -p fdroid-tv/repo
+          cp "${{ steps.apkinfo.outputs.out_name }}" fdroid-tv/repo/
+
+      - name: Commit and push APK to fdroid-tv
+        working-directory: fdroid-tv
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "repo/${{ steps.apkinfo.outputs.out_name }}"
+          git commit -m "Add ${{ steps.apkinfo.outputs.package_id }} v${{ steps.apkinfo.outputs.version_code }}" || echo "Nothing to commit"
+          git push
+
+      # Kick off fdroid-tv's own update-index.yml so the repo index gets
+      # regenerated as soon as this APK lands.
+      - name: Trigger fdroid-tv index update
+        run: |
+          curl -fsSL -X POST \
+            -H "Authorization: token ${{ secrets.FDROID_REPO_PAT }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/northstar-works/fdroid-tv/actions/workflows/update-index.yml/dispatches \
+            -d '{"ref":"main"}'
+
+      - name: Upload APK as build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.apkinfo.outputs.out_name }}
+          path: ${{ steps.apkinfo.outputs.out_name }}
