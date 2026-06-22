@@ -2,6 +2,16 @@ plugins {
     id 'com.android.application'
 }
 
+def appRemoteVersionCode = (project.findProperty('APP_REMOTE_RECEIVER_VERSION_CODE') ?: '5') as Integer
+def appRemoteVersionName = (project.findProperty('APP_REMOTE_RECEIVER_VERSION_NAME') ?: '1.0.4') as String
+
+def fdroidStoreFile = project.findProperty('FDROID_STORE_FILE') ?: System.getenv('FDROID_STORE_FILE')
+def fdroidStorePassword = project.findProperty('FDROID_STORE_PASSWORD') ?: System.getenv('FDROID_STORE_PASSWORD')
+def fdroidKeyAlias = project.findProperty('FDROID_KEY_ALIAS') ?: System.getenv('FDROID_KEY_ALIAS')
+def fdroidKeyPassword = project.findProperty('FDROID_KEY_PASSWORD') ?: System.getenv('FDROID_KEY_PASSWORD')
+
+def hasReleaseSigning = fdroidStoreFile && fdroidStorePassword && fdroidKeyAlias && fdroidKeyPassword
+
 android {
     namespace 'pro.northstarlabs.appremotereceiver'
     compileSdk 35
@@ -10,8 +20,33 @@ android {
         applicationId 'pro.northstarlabs.appremotereceiver'
         minSdk 23
         targetSdk 35
-        versionCode 4
-        versionName '1.0.3'
+        versionCode appRemoteVersionCode
+        versionName appRemoteVersionName
+    }
+
+    signingConfigs {
+        if (hasReleaseSigning) {
+            release {
+                storeFile file(fdroidStoreFile)
+                storePassword fdroidStorePassword
+                keyAlias fdroidKeyAlias
+                keyPassword fdroidKeyPassword
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            shrinkResources false
+            if (hasReleaseSigning) {
+                signingConfig signingConfigs.release
+            }
+        }
+        debug {
+            applicationIdSuffix '.debug'
+            versionNameSuffix '-debug'
+        }
     }
 
     lint {
