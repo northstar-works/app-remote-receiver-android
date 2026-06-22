@@ -1,100 +1,251 @@
-name: Build and Publish to F-Droid TV
+name: Build App Remote Receiver and Publish to F-Droid TV
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  actions: read
 
 jobs:
   build-and-publish:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout app-remote-receiver
         uses: actions/checkout@v4
 
-      - name: Set up JDK 17
+      - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
-          java-version: '17'
-          distribution: 'temurin'
+          distribution: temurin
+          java-version: "17"
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
 
-      - name: Grant execute permission for gradlew
-        run: chmod +x gradlew
-
-      # Decode the universal northstar-labs.jks keystore from secret.
-      # Same keystore used across all Northstar Labs apps so the F-Droid
-      # AllowedAPKSigningKeys fingerprint stays consistent.
-      - name: Decode keystore
-        run: echo "${{ secrets.FDROID_KEYSTORE_B64 }}" | base64 -d > release.jks
-
-      # NOTE: app/build.gradle's signingConfigs.release block must read these
-      # same env var names (KEYSTORE_FILE / KEYSTORE_PASSWORD / KEY_ALIAS / KEY_PASSWORD).
-      # Adjust if this project's signing config uses different names.
-      - name: Build release APK
-        run: ./gradlew assembleRelease
-        env:
-          KEYSTORE_FILE: ${{ github.workspace }}/release.jks
-          KEYSTORE_PASSWORD: ${{ secrets.FDROID_KEYSTORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.FDROID_KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.FDROID_KEY_PASSWORD }}
-
-      - name: Locate APK and extract version info
-        id: apkinfo
+      - name: Make Gradle wrapper executable
         run: |
-          set -euo pipefail
-          PKG="pro.northstarlabs.appremotereceiver"
-          APK=$(find app/build/outputs/apk/release -name "*.apk" | head -n1)
-          if [ -z "$APK" ]; then
-            echo "ERROR: no release APK found" >&2
+          if [ -f "./gradlew" ]; then
+            chmod +x ./gradlew
+          fi
+
+      # Decode this app's dedicated release keystore.
+      # NOTE: this is App Remote Receiver's OWN keystore — separate from
+      # any other app's release key, and separate from the F-Droid repo's
+      # own index-signing keystore (that one lives inside the fdroid-tv
+      # repo itself and is handled by `fdroid update` below).
+      - name: Restore persistent release keystore
+        id: keystore
+        env:
+          FDROID_KEYSTORE_B64: ${{ secrets.FDROID_KEYSTORE_B64 }}
+        run: |
+          set -e
+          if [ -z "$FDROID_KEYSTORE_B64" ]; then
+            echo "ERROR: FDROID_KEYSTORE_B64 secret is missing on this repo." >&2
+            echo "Secrets don't carry over between repos — set it here specifically." >&2
             exit 1
           fi
-          VCODE=$(grep -oP 'versionCode\s+\K[0-9]+' app/build.gradle | head -n1)
-          if [ -z "$VCODE" ]; then
-            echo "ERROR: could not extract versionCode from app/build.gradle" >&2
+          printf '%s' "$FDROID_KEYSTORE_B64" | base64 -d -i > "$RUNNER_TEMP/fdroid-release.keystore"
+          SIZE=$(stat -c%s "$RUNNER_TEMP/fdroid-release.keystore")
+          if [ "$SIZE" -lt 100 ]; then
+            echo "ERROR: decoded keystore is only $SIZE bytes — secret is malformed." >&2
             exit 1
           fi
-          OUT_NAME="${PKG}_${VCODE}.apk"
-          cp "$APK" "$OUT_NAME"
-          echo "package_id=$PKG"     >> "$GITHUB_OUTPUT"
-          echo "version_code=$VCODE" >> "$GITHUB_OUTPUT"
-          echo "out_name=$OUT_NAME"  >> "$GITHUB_OUTPUT"
+          echo "store_file=$RUNNER_TEMP/fdroid-release.keystore" >> "$GITHUB_OUTPUT"
 
       - name: Checkout fdroid-tv repo
-        uses: actions/checkout@v4
-        with:
-          repository: northstar-works/fdroid-tv
-          path: fdroid-tv
-          token: ${{ secrets.FDROID_REPO_PAT }}
-
-      - name: Copy signed APK into fdroid-tv repo
         run: |
-          mkdir -p fdroid-tv/repo
-          cp "${{ steps.apkinfo.outputs.out_name }}" fdroid-tv/repo/
+          git clone https://x-access-token:${{ secrets.FDROID_REPO_PAT }}@github.com/northstar-works/fdroid-tv.git fdroid-repo
 
-      - name: Commit and push APK to fdroid-tv
-        working-directory: fdroid-tv
+      - name: Compute Android version
+        id: version
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add "repo/${{ steps.apkinfo.outputs.out_name }}"
-          git commit -m "Add ${{ steps.apkinfo.outputs.package_id }} v${{ steps.apkinfo.outputs.version_code }}" || echo "Nothing to commit"
-          git push
+          set -e
+          PKG="pro.northstarlabs.appremotereceiver"
+          BASE_VERSION="1.0"
 
-      # Kick off fdroid-tv's own update-index.yml so the repo index gets
-      # regenerated as soon as this APK lands.
-      - name: Trigger fdroid-tv index update
+          # Auto-increment versionCode by scanning what's already published
+          # in fdroid-tv for this package, then add 1. Avoids manual bumping
+          # and guarantees a monotonically increasing versionCode.
+          HIGHEST=0
+          if [ -d fdroid-repo/repo ]; then
+            for f in fdroid-repo/repo/${PKG}_*.apk; do
+              [ -e "$f" ] || continue
+              CODE="$(basename "$f" | sed -n "s/^${PKG}_\([0-9][0-9]*\)\.apk$/\1/p")"
+              if [ -n "$CODE" ] && [ "$CODE" -gt "$HIGHEST" ]; then
+                HIGHEST="$CODE"
+              fi
+            done
+          fi
+
+          VERSION_CODE=$((HIGHEST + 1))
+          VERSION_NAME="${BASE_VERSION}.${VERSION_CODE}"
+
+          echo "base_version=$BASE_VERSION" >> "$GITHUB_OUTPUT"
+          echo "version_code=$VERSION_CODE" >> "$GITHUB_OUTPUT"
+          echo "version_name=$VERSION_NAME" >> "$GITHUB_OUTPUT"
+          echo "Highest published versionCode: $HIGHEST"
+          echo "Building App Remote Receiver $VERSION_NAME ($VERSION_CODE)"
+
+      # NOTE: app/build.gradle's signingConfigs block must read these same
+      # Gradle property names (fdroidStoreFile, fdroidStorePassword,
+      # fdroidKeyAlias, fdroidKeyPassword) — same convention used by
+      # fantag-android and streamvault. If app-remote-receiver's build.gradle
+      # uses different property names, update the -P flags below to match.
+      - name: Build signed release APK
+        env:
+          FDROID_STORE_FILE: ${{ steps.keystore.outputs.store_file }}
+          FDROID_STORE_PASSWORD: ${{ secrets.FDROID_KEYSTORE_PASSWORD }}
+          FDROID_KEY_ALIAS: ${{ secrets.FDROID_KEY_ALIAS }}
+          FDROID_KEY_PASSWORD: ${{ secrets.FDROID_KEY_PASSWORD }}
         run: |
-          curl -fsSL -X POST \
-            -H "Authorization: token ${{ secrets.FDROID_REPO_PAT }}" \
-            -H "Accept: application/vnd.github.v3+json" \
-            https://api.github.com/repos/northstar-works/fdroid-tv/actions/workflows/update-index.yml/dispatches \
-            -d '{"ref":"main"}'
+          ./gradlew --no-daemon clean assembleRelease \
+            -PAPP_REMOTE_RECEIVER_VERSION_CODE="${{ steps.version.outputs.version_code }}" \
+            -PAPP_REMOTE_RECEIVER_VERSION_NAME="${{ steps.version.outputs.version_name }}" \
+            -PFDROID_STORE_FILE="$FDROID_STORE_FILE" \
+            -PFDROID_STORE_PASSWORD="$FDROID_STORE_PASSWORD" \
+            -PFDROID_KEY_ALIAS="$FDROID_KEY_ALIAS" \
+            -PFDROID_KEY_PASSWORD="$FDROID_KEY_PASSWORD"
 
-      - name: Upload APK as build artifact
+      - name: Locate and verify APK
+        id: apk
+        run: |
+          set -e
+
+          APK="$(find app/build/outputs/apk/release -type f -name "*.apk" | grep -v androidTest | grep -v unsigned | head -n 1)"
+          if [ -z "$APK" ]; then
+            APK="$(find app/build/outputs/apk -type f -name "*.apk" | grep -v androidTest | grep -v unsigned | head -n 1)"
+          fi
+
+          if [ -z "$APK" ]; then
+            echo "ERROR: No APK found." >&2
+            exit 1
+          fi
+
+          SIZE="$(stat -c%s "$APK")"
+          echo "APK=$APK"
+          echo "SIZE=$SIZE"
+
+          if [ "$SIZE" -lt 500000 ]; then
+            echo "ERROR: APK is too small. Refusing to publish bad APK." >&2
+            ls -lh "$APK"
+            exit 1
+          fi
+
+          AAPT="$(find "$ANDROID_HOME/build-tools" -name aapt | sort -V | tail -n 1)"
+          BADGING="$($AAPT dump badging "$APK")"
+
+          PACKAGE="$(echo "$BADGING" | sed -n "s/package: name='\([^']*\)'.*/\1/p")"
+          VERSION_CODE="$(echo "$BADGING" | sed -n "s/.*versionCode='\([^']*\)'.*/\1/p")"
+          VERSION_NAME="$(echo "$BADGING" | sed -n "s/.*versionName='\([^']*\)'.*/\1/p")"
+
+          if [ -z "$PACKAGE" ] || [ -z "$VERSION_CODE" ]; then
+            echo "ERROR: Could not read APK package/version." >&2
+            echo "$BADGING"
+            exit 1
+          fi
+
+          # Verify the APK is actually signed — an unsigned/debug APK breaks
+          # F-Droid updates.
+          APKSIGNER="$(find "$ANDROID_HOME/build-tools" -name apksigner | sort -V | tail -n 1)"
+          if ! "$APKSIGNER" verify --print-certs "$APK" >/dev/null 2>&1; then
+            echo "ERROR: APK failed signature verification." >&2
+            exit 1
+          fi
+
+          OUT_NAME="${PACKAGE}_${VERSION_CODE}.apk"
+
+          echo "package=$PACKAGE" >> "$GITHUB_OUTPUT"
+          echo "version_code=$VERSION_CODE" >> "$GITHUB_OUTPUT"
+          echo "version_name=$VERSION_NAME" >> "$GITHUB_OUTPUT"
+          echo "apk_path=$APK" >> "$GITHUB_OUTPUT"
+          echo "out_name=$OUT_NAME" >> "$GITHUB_OUTPUT"
+
+          echo "Detected package: $PACKAGE"
+          echo "Detected versionCode: $VERSION_CODE"
+          echo "Detected versionName: $VERSION_NAME"
+          echo "Output APK name: $OUT_NAME"
+
+      - name: Upload APK artifact for backup only
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.apkinfo.outputs.out_name }}
-          path: ${{ steps.apkinfo.outputs.out_name }}
+          name: app-remote-receiver-apk-${{ steps.apk.outputs.version_code }}
+          path: ${{ steps.apk.outputs.apk_path }}
+
+      - name: Install F-Droid server tools
+        run: |
+          set -e
+          sudo apt-get update
+          sudo apt-get install -y fdroidserver
+
+      - name: Copy APK and update F-Droid metadata
+        run: |
+          set -e
+
+          mkdir -p fdroid-repo/repo fdroid-repo/metadata
+          cp "${{ steps.apk.outputs.apk_path }}" "fdroid-repo/repo/${{ steps.apk.outputs.out_name }}"
+
+          cat > fdroid-repo/metadata/pro.northstarlabs.appremotereceiver.yml <<EOF
+          Name: App Remote Receiver
+          Summary: Remote control receiver for Fire TV and Android
+          Description: |-
+              App Remote Receiver runs on Fire TV and Android TV devices, listening for
+              commands from a paired companion app. Pair once, then control playback,
+              navigation, and app actions remotely without needing the TV remote in hand.
+              No accounts. No tracking. No ads.
+
+          Categories:
+            - System
+            - Connectivity
+          License: Proprietary
+          AuthorName: Northstar Labs
+          AuthorWebSite: https://github.com/northstar-works
+          SourceCode: https://github.com/northstar-works/app-remote-receiver
+          IssueTracker: https://github.com/northstar-works/app-remote-receiver/issues
+
+          RepoType: git
+          Repo: https://github.com/northstar-works/app-remote-receiver
+
+          AutoUpdateMode: None
+          UpdateCheckMode: None
+
+          CurrentVersion: ${{ steps.apk.outputs.version_name }}
+          CurrentVersionCode: ${{ steps.apk.outputs.version_code }}
+          EOF
+
+          echo "Copied APK:"
+          ls -lh "fdroid-repo/repo/${{ steps.apk.outputs.out_name }}"
+          echo "Updated metadata:"
+          cat fdroid-repo/metadata/pro.northstarlabs.appremotereceiver.yml
+
+      - name: Regenerate F-Droid index
+        run: |
+          set -e
+          cd fdroid-repo
+          # config.yml + signing keystore live in the fdroid-tv repo itself;
+          # fdroid update rebuilds the signed index so the F-Droid app sees
+          # the new versionCode.
+          fdroid update --create-metadata --pretty || fdroid update --pretty
+
+      - name: Commit APK and index to fdroid-tv
+        run: |
+          set -e
+
+          cd fdroid-repo
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add repo metadata
+
+          if git diff --cached --quiet; then
+            echo "No fdroid-tv repo changes to commit."
+            exit 0
+          fi
+
+          git commit -m "Add App Remote Receiver ${{ steps.apk.outputs.version_name }} APK ${{ steps.apk.outputs.version_code }}"
+          git push
